@@ -8,7 +8,7 @@
     "dev": "vite",
     "start-server": "node server.js",
     "dev-all": "concurrently \"npm run start-server\" \"npm run dev\"",
-    "build": "react-scripts build",
+    "build": "vite build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
   },
