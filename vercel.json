@@ -9,18 +9,22 @@
       }
     },
     {
-      "src": "server.js",
+      "src": "server/server.js",
       "use": "@vercel/node"
     }
   ],
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "server.js"
+      "dest": "server/server.js"
     },
     {
       "src": "/(.*)",
       "dest": "/dist/$1"
     }
-  ]
+  ],
+  "env": {
+    "MONGODB_URI": "@mongodb_uri",
+    "FRONTEND_URL": "@frontend_url"
+  }
 } 

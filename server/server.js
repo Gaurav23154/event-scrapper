@@ -2,51 +2,19 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import puppeteer from 'puppeteer';
-import sqlite3 from 'sqlite3';
+import { MongoClient } from 'mongodb';
 import { v4 as uuidv4 } from 'uuid';
 import dayjs from 'dayjs';
 
-const sqlite = sqlite3.verbose();
-const db = new sqlite.Database('./events.db');
 const app = express();
 
-// Initialize database
-db.serialize(() => {
-  console.log('Initializing database...');
-  db.run(`
-    CREATE TABLE IF NOT EXISTS events (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      description TEXT,
-      date TEXT,
-      time TEXT,
-      location TEXT,
-      price TEXT,
-      image_url TEXT,
-      source_url TEXT,
-      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `, (err) => {
-    if (err) console.error('Error creating events table:', err);
-    else console.log('Events table ready');
-  });
-  
-  db.run(`
-    CREATE TABLE IF NOT EXISTS subscribers (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE,
-      event_id TEXT,
-      FOREIGN KEY(event_id) REFERENCES events(id)
-    )
-  `, (err) => {
-    if (err) console.error('Error creating subscribers table:', err);
-    else console.log('Subscribers table ready');
-  });
-});
+// MongoDB connection
+const uri = process.env.MONGODB_URI;
+const client = new MongoClient(uri);
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:5173',
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   methods: ['GET', 'POST'],
   credentials: true
 }));
@@ -78,7 +46,6 @@ async function scrapeEvents() {
       waitUntil: 'networkidle0'
     });
 
-    // Wait for content to load
     await page.waitForSelector('.card__content, .article-card', { timeout: 10000 });
 
     const timeoutEvents = await page.evaluate(() => {
@@ -119,7 +86,6 @@ async function scrapeEvents() {
       waitUntil: 'networkidle0'
     });
 
-    // Wait for any event-related content
     await page.waitForSelector('[data-testid="event-card"], .eds-event-card, .eds-media-card-content', { timeout: 10000 });
 
     const eventbriteEvents = await page.evaluate(() => {
@@ -157,87 +123,96 @@ async function scrapeEvents() {
   await browser.close();
   console.log(`Total events scraped: ${events.length}`);
 
-  // Save to DB
+  // Save to MongoDB
   if (events.length > 0) {
-    console.log('Saving events to database...');
-    events.forEach(event => {
-      const formattedDate = dayjs(event.date).format('YYYY-MM-DD');
-      db.run(
-        `INSERT OR REPLACE INTO events 
-         (id, title, description, date, time, location, price, image_url, source_url) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          uuidv4(),
-          event.title,
-          event.description,
-          formattedDate,
-          event.time || 'Check website',
-          event.location,
-          event.price,
-          event.image_url,
-          event.source_url
-        ],
-        err => {
-          if (err) console.error('Error inserting event:', err);
-          else console.log('Event inserted:', event.title);
-        }
-      );
-    });
-  } else {
-    console.log('No events to save to database');
+    try {
+      await client.connect();
+      const db = client.db('events');
+      const eventsCollection = db.collection('events');
+      const subscribersCollection = db.collection('subscribers');
+
+      // Create indexes
+      await eventsCollection.createIndex({ title: 1 });
+      await subscribersCollection.createIndex({ email: 1, event_id: 1 }, { unique: true });
+
+      // Insert events
+      for (const event of events) {
+        const formattedDate = dayjs(event.date).format('YYYY-MM-DD');
+        await eventsCollection.updateOne(
+          { title: event.title },
+          {
+            $set: {
+              id: uuidv4(),
+              title: event.title,
+              description: event.description,
+              date: formattedDate,
+              time: event.time || 'Check website',
+              location: event.location,
+              price: event.price,
+              image_url: event.image_url,
+              source_url: event.source_url,
+              last_updated: new Date()
+            }
+          },
+          { upsert: true }
+        );
+      }
+      console.log('Events saved to MongoDB');
+    } catch (err) {
+      console.error('Error saving to MongoDB:', err);
+    } finally {
+      await client.close();
+    }
   }
 }
 
 // API endpoints
-app.get('/api/events', (req, res) => {
-  console.log('Received request for events');
-  db.all('SELECT * FROM events ORDER BY date ASC', (err, events) => {
-    if (err) {
-      console.error('Database error:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    console.log(`Returning ${events.length} events`);
+app.get('/api/events', async (req, res) => {
+  try {
+    await client.connect();
+    const db = client.db('events');
+    const events = await db.collection('events').find().sort({ date: 1 }).toArray();
     res.json(events);
-  });
+  } catch (err) {
+    console.error('Database error:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    await client.close();
+  }
 });
 
-app.post('/api/subscribe', (req, res) => {
+app.post('/api/subscribe', async (req, res) => {
   const { email, eventId } = req.body;
   if (!email || !eventId) return res.status(400).json({ error: 'Missing data' });
 
-  db.get('SELECT * FROM subscribers WHERE email = ? AND event_id = ?', [email, eventId], (err, existing) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
+  try {
+    await client.connect();
+    const db = client.db('events');
+    
+    // Check if already subscribed
+    const existing = await db.collection('subscribers').findOne({ email, event_id: eventId });
     if (existing) return res.status(400).json({ error: 'Already subscribed' });
 
-    db.run('INSERT INTO subscribers (id, email, event_id) VALUES (?, ?, ?)', [uuidv4(), email, eventId], err => {
-      if (err) return res.status(400).json({ error: 'Subscription failed' });
+    // Get event details
+    const event = await db.collection('events').findOne({ id: eventId });
+    if (!event) return res.status(404).json({ error: 'Event not found' });
 
-      db.get('SELECT source_url FROM events WHERE id = ?', [eventId], (err, event) => {
-        if (err || !event) return res.status(404).json({ error: 'Event not found' });
-        res.json({ redirectUrl: event.source_url });
-      });
+    // Add subscription
+    await db.collection('subscribers').insertOne({
+      id: uuidv4(),
+      email,
+      event_id: eventId,
+      created_at: new Date()
     });
-  });
-});
 
-// Start the server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  // Start initial scrape
-  console.log('Starting initial event scrape...');
-  scrapeEvents().catch(err => {
-    console.error('Error during initial scrape:', err);
-  });
+    res.json({ redirectUrl: event.source_url });
+  } catch (err) {
+    console.error('Database error:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    await client.close();
+  }
 });
-
-// Schedule scraping (every 6 hours)
-setInterval(() => {
-  console.log('Starting scheduled event scrape...');
-  scrapeEvents().catch(err => {
-    console.error('Error during scheduled scrape:', err);
-  });
-}, 6 * 60 * 60 * 1000);
 
 // Add a test endpoint to manually trigger scraping
 app.post('/api/scrape', async (req, res) => {
@@ -250,3 +225,6 @@ app.post('/api/scrape', async (req, res) => {
     res.status(500).json({ error: 'Scraping failed' });
   }
 });
+
+// For Vercel serverless functions
+export default app;
