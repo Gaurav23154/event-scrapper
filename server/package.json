@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
+  "scripts": {
+    "build": "echo 'No build step required'",
+    "start": "node server.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
